@@ -1,0 +1,226 @@
+name: Build BetterGI
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 1.0.0)'
+        required: false
+        type: string
+
+env:
+  SOLUTION_FILE: BetterGenshinImpact.sln
+  NET_VERSION: '8.0'
+  WINDOWS_VERSION: '10.0.22621.0'
+  CONFIGURATION: Release
+  BUILD_PLATFORM: x64
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v1.3.1
+      with:
+        vs-prerelease: true
+        msbuild-architecture: ${{ env.BUILD_PLATFORM }}
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: |
+          6.0.x
+          7.0.x
+          8.0.x
+        
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Clear NuGet Cache
+      run: dotnet nuget locals all --clear
+
+    - name: Restore NuGet packages
+      run: |
+        dotnet restore ${{ env.SOLUTION_FILE }} -p:Platform=${{ env.BUILD_PLATFORM }}
+
+    - name: Create Build Directory
+      run: |
+        mkdir -p dist/BetterGI
+
+    # 创建发布配置文件
+    - name: Create PublishProfile
+      shell: pwsh
+      run: |
+        # 为主项目创建发布配置
+        $mainProjectPath = "BetterGenshinImpact"
+        $publishProfilePath = "$mainProjectPath\Properties\PublishProfiles"
+        
+        # 确保目录存在
+        New-Item -Path $publishProfilePath -ItemType Directory -Force
+        
+        $profileContent = @"
+        <?xml version="1.0" encoding="utf-8"?>
+        <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+          <PropertyGroup>
+            <Configuration>Release</Configuration>
+            <Platform>x64</Platform>
+            <PublishDir>bin\Release\net${{ env.NET_VERSION }}-windows${{ env.WINDOWS_VERSION }}\publish\win-x64\</PublishDir>
+            <PublishProtocol>FileSystem</PublishProtocol>
+            <_TargetId>Folder</_TargetId>
+            <TargetFramework>net${{ env.NET_VERSION }}-windows${{ env.WINDOWS_VERSION }}</TargetFramework>
+            <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+            <SelfContained>true</SelfContained>
+            <PublishSingleFile>false</PublishSingleFile>
+            <PublishReadyToRun>false</PublishReadyToRun>
+            <PublishTrimmed>false</PublishTrimmed>
+          </PropertyGroup>
+        </Project>
+        "@
+        
+        # 写入发布配置文件
+        $profileContent | Out-File -FilePath "$publishProfilePath\FolderProfile.pubxml" -Encoding UTF8
+        
+        Write-Host "发布配置文件已创建在: $publishProfilePath\FolderProfile.pubxml"
+        
+        # 为其他项目创建基础发布配置
+        $projects = @(
+            "Fischless.WindowsInput",
+            "Fischless.HotkeyCapture",
+            "Fischless.GameCapture",
+            "Test\BetterGenshinImpact.UnitTest",
+            "Test\BetterGenshinImpact.Test"
+        )
+        
+        foreach ($project in $projects) {
+            $projectPublishPath = "$project\Properties\PublishProfiles"
+            New-Item -Path $projectPublishPath -ItemType Directory -Force
+            
+            $basicProfileContent = @"
+        <?xml version="1.0" encoding="utf-8"?>
+        <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+          <PropertyGroup>
+            <Configuration>Release</Configuration>
+            <Platform>x64</Platform>
+            <PublishProtocol>FileSystem</PublishProtocol>
+          </PropertyGroup>
+        </Project>
+        "@
+            $basicProfileContent | Out-File -FilePath "$projectPublishPath\FolderProfile.pubxml" -Encoding UTF8
+            Write-Host "基础发布配置文件已创建在: $projectPublishPath\FolderProfile.pubxml"
+        }
+
+    - name: Build Solution
+      run: |
+        msbuild ${{ env.SOLUTION_FILE }} /p:Configuration=${{ env.CONFIGURATION }} /p:Platform=${{ env.BUILD_PLATFORM }} /m /p:RestorePackagesConfig=true /t:restore
+        msbuild ${{ env.SOLUTION_FILE }} /p:Configuration=${{ env.CONFIGURATION }} /p:Platform=${{ env.BUILD_PLATFORM }} /m
+
+    - name: Publish Application
+      run: |
+        dotnet publish BetterGenshinImpact/BetterGenshinImpact.csproj `
+          -c ${{ env.CONFIGURATION }} `
+          -r win-x64 `
+          --self-contained true `
+          -p:Platform=${{ env.BUILD_PLATFORM }} `
+          -p:PublishReadyToRun=false `
+          -p:PublishSingleFile=false `
+          -p:PublishTrimmed=false `
+          -f net${{ env.NET_VERSION }}-windows${{ env.WINDOWS_VERSION }}
+
+    - name: Install 7-Zip
+      shell: pwsh
+      run: |
+        $url = "https://www.7-zip.org/a/7z2301-x64.exe"
+        Invoke-WebRequest -Uri $url -OutFile "7z-installer.exe"
+        Start-Process -FilePath "7z-installer.exe" -Args "/S" -Wait
+        echo "C:\Program Files\7-Zip" >> $env:GITHUB_PATH
+
+    - name: Get Version
+      id: get_version
+      shell: pwsh
+      run: |
+        $version = Select-String -Path "BetterGenshinImpact/BetterGenshinImpact.csproj" -Pattern '<AssemblyVersion>(.*)</AssemblyVersion>' | 
+          ForEach-Object { $_.Matches.Groups[1].Value }
+        if ("${{ github.event.inputs.version }}" -ne "") {
+          $version = "${{ github.event.inputs.version }}"
+        }
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+        echo "Version: $version"
+
+    - name: Build Setup Project
+      run: |
+        # 清理之前的构建文件
+        Remove-Item -Path "Build/MicaSetup/obj" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "Build/MicaSetup/bin" -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # 构建卸载程序
+        msbuild Build/MicaSetup/MicaSetup.Uninst.csproj `
+          /p:Configuration=${{ env.CONFIGURATION }} `
+          /p:Platform=${{ env.BUILD_PLATFORM }} `
+          /p:RestorePackagesConfig=true `
+          /t:restore,rebuild
+        
+        # 复制卸载程序
+        Copy-Item -Path "Build/MicaSetup/bin/${{ env.CONFIGURATION }}/net472/MicaSetup.exe" `
+                 -Destination "Build/MicaSetup/Resources/Setups/Uninst.exe" `
+                 -Force
+        
+        # 构建安装程序
+        msbuild Build/MicaSetup/MicaSetup.csproj `
+          /p:Configuration=${{ env.CONFIGURATION }} `
+          /p:Platform=${{ env.BUILD_PLATFORM }} `
+          /p:RestorePackagesConfig=true `
+          /t:restore,rebuild
+
+    - name: Package Application
+      shell: pwsh
+      run: |
+        $version = "${{ steps.get_version.outputs.version }}"
+        $publishPath = "BetterGenshinImpact/bin/${{ env.BUILD_PLATFORM }}/${{ env.CONFIGURATION }}/net${{ env.NET_VERSION }}-windows${{ env.WINDOWS_VERSION }}/publish/win-x64"
+        
+        # 清理不需要的文件
+        Remove-Item -Path "$publishPath/*.lib" -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$publishPath/*ffmpeg*.dll" -Force -ErrorAction SilentlyContinue
+        
+        # 打包应用
+        7z a "BetterGI_v${version}.7z" "$publishPath/*" -mx=5 -mf=BCJ2 -r -y
+        Copy-Item "BetterGI_v${version}.7z" "Build/MicaSetup/Resources/Setups/publish.7z" -Force
+        Copy-Item "Build/MicaSetup/bin/${{ env.CONFIGURATION }}/net472/MicaSetup.exe" "BetterGI_Setup_v${version}.exe" -Force
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: BetterGI-v${{ steps.get_version.outputs.version }}
+        path: |
+          BetterGI_v${{ steps.get_version.outputs.version }}.7z
+          BetterGI_Setup_v${{ steps.get_version.outputs.version }}.exe
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          BetterGI_v${{ steps.get_version.outputs.version }}.7z
+          BetterGI_Setup_v${{ steps.get_version.outputs.version }}.exe
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
